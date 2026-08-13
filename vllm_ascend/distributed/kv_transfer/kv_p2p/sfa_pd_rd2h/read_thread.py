@@ -146,6 +146,18 @@ class MembPullReadThread(threading.Thread):
     def run(self):
         from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 
+        # Bind this thread to the worker's NPU so that hybm device-rdma
+        # OpenDevice (which resolves the device via AclrtGetDevice on the
+        # calling thread) picks the right device instead of 0. Without this
+        # every TP rank's read thread lands on device 0 and TsdOpen fails
+        # with ret=31. send_thread.py already does the equivalent.
+        try:
+            import torch
+            from vllm.distributed import get_world_group
+            torch.npu.set_device(torch.device(f"npu:{get_world_group().local_rank}"))
+        except BaseException as _e:
+            logger.warning("MembPull read thread set_device failed: %s", _e)
+
         handshake_port = self.side_channel_port + self.tp_rank
         path = make_zmq_path("tcp", self._host, handshake_port)
         logger.info("MembPull read thread listening on: %s", path)
