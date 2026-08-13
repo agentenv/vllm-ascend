@@ -121,7 +121,16 @@ class GlobalMemfabricTE:
         set_log_level(2)
         set_conf_store_tls(False, "")
         raw_engine = TransferEngine()
-        store_url = f"tcp://{hostname}"
+        # The config store is hosted by the Prefill side (store_server_role
+        # below). Every party must connect to the SAME store, or P and D end
+        # up in disjoint hybm groups and rank resolution degrades to 0,
+        # failing BatchCopyG2G with "invalid param". Allow the D side to point
+        # at the P host explicitly.
+        import os as _os
+        import _pymf_transfer as _pymf
+        _DEVICE_RDMA_OPTYPE = _pymf.TransDataOpType.DEVICE_RDMA
+        _store_host = _os.getenv("MEMFABRIC_STORE_HOST", hostname)
+        store_url = f"tcp://{_store_host}"
 
         logger.info(
             "MemFabric TransferEngine initialize: store_url=%s, unique_id=%s, role=%s, device_id=%s",
@@ -135,6 +144,7 @@ class GlobalMemfabricTE:
             hostname,
             self._role,
             self._device_id,
+            data_op_type=_DEVICE_RDMA_OPTYPE,
             store_server_role=MEMFABRIC_ROLE_PREFILL,
         )
         if ret != 0:
