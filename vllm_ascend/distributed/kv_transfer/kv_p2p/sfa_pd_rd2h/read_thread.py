@@ -629,8 +629,14 @@ class MembPullReadThread(threading.Thread):
                     "n_indexer": n_indexer,
                     "num_transfers": 0,
                 },
+                0,
             )
 
+        # BOUNCEV2: main K/V chunks are appended first; their coalesced count
+        # tells the caller which local ptrs point at the CPU offload pool.
+        _n_cpu_transfers = 0
+        if n_main and len(peer_chunks) >= 2:
+            _n_cpu_transfers = len(peer_chunks[0]) + len(peer_chunks[1])
         peer_ptrs = np.concatenate(peer_chunks).tolist()
         local_ptrs = np.concatenate(local_chunks).tolist()
         lengths = np.concatenate(length_chunks).tolist()
@@ -649,7 +655,7 @@ class MembPullReadThread(threading.Thread):
                 "num_transfers": len(local_ptrs),
                 "atomic_transfers": 2 * n_main + n_indexer,
             }
-        return local_ptrs, peer_ptrs, lengths, info
+        return local_ptrs, peer_ptrs, lengths, info, _n_cpu_transfers
 
     def _log_read_result(self, read_info: dict[str, Any]) -> None:
         layer_name = read_info["layer_name"]
@@ -688,6 +694,7 @@ class MembPullReadThread(threading.Thread):
         all_local_ptrs: list[int] = []
         all_peer_ptrs: list[int] = []
         all_lengths: list[int] = []
+        all_kinds: list[int] = []
         read_infos: list[dict[str, Any]] = []
         for (
             ext_req_id,
@@ -696,7 +703,7 @@ class MembPullReadThread(threading.Thread):
             main_start_block,
             indexer_start_block,
         ) in read_reqs:
-            local_ptrs, peer_ptrs, lengths, read_info = self._build_req_descriptors(
+            local_ptrs, peer_ptrs, lengths, read_info, _n_cpu = self._build_req_descriptors(
                 layer,
                 ext_req_id,
                 p_main_block_ids,
@@ -738,6 +745,7 @@ class MembPullReadThread(threading.Thread):
             all_local_ptrs.extend(local_ptrs)
             all_peer_ptrs.extend(peer_ptrs)
             all_lengths.extend(lengths)
+            all_kinds.extend([1] * _n_cpu + [0] * (len(local_ptrs) - _n_cpu))
             if want_info:
                 assert read_info is not None
                 read_infos.append(read_info)
@@ -759,7 +767,39 @@ class MembPullReadThread(threading.Thread):
                 len(all_local_ptrs),
                 atomic_total,
             )
-        ret = self.engine.batch_transfer_sync_read(p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
+        # CPU-pool destinations are GVAs owned by the sparse-offload hybm
+        # entity; inside the TransferEngine entity they resolve to rank 0 and
+        # BatchCopyG2G rejects them ("invalid param"). Read those into a plain
+        # host bounce buffer (classified as local host memory), then memmove
+        # into the pool. Device (indexer) targets go through untouched.
+        # Enabled via SFAPD_BOUNCE_READ=1 (env centralization pending).
+        import os as _os
+        if _os.getenv("SFAPD_BOUNCE_READ", "0") == "1" and any(all_kinds):
+            import ctypes as _ct
+            import torch as _torch
+            _cpu_total = sum(L for L, k in zip(all_lengths, all_kinds) if k == 1)
+            buf = getattr(self, "_bounce_buf", None)
+            if buf is None or buf.numel() < _cpu_total:
+                buf = _torch.empty(max(_cpu_total, 1 << 26), dtype=_torch.uint8)
+                self._bounce_buf = buf
+            _base = buf.data_ptr()
+            _send_ptrs = []
+            _fixups = []  # (orig_ptr, bounce_ptr, length)
+            _off = 0
+            for _p, _L, _k in zip(all_local_ptrs, all_lengths, all_kinds):
+                if _k == 1:
+                    _bp = _base + _off
+                    _off += _L
+                    _send_ptrs.append(_bp)
+                    _fixups.append((_p, _bp, _L))
+                else:
+                    _send_ptrs.append(_p)
+            ret = self.engine.batch_transfer_sync_read(p_session, _send_ptrs, all_peer_ptrs, all_lengths)
+            if ret == 0:
+                for _p, _bp, _L in _fixups:
+                    _ct.memmove(_p, _bp, _L)
+        else:
+            ret = self.engine.batch_transfer_sync_read(p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
         if ret != 0:
             raise RuntimeError(f"memfabric batch read failed for layer {layer_name}, ret={ret}")
         for read_info in read_infos:
