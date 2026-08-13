@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import regex as re
+import sys
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
@@ -223,6 +224,15 @@ class SFAPDRD2HConsumerWorker:
         local_failed: set[str],
     ) -> list[tuple[set[str], set[str]]]:
         if self.tp_size == 1:
+            return [(local_terminal, local_failed)]
+        if sys.exc_info()[0] is not None:
+            # An exception is unwinding out of the model forward and this is
+            # being reached from the connector context manager's __exit__.
+            # Other ranks are still inside the forward and its own collectives,
+            # so joining one here deadlocks and swallows the original error.
+            logger.warning(
+                "MembPull D skipping TP read-status gather while an exception unwinds."
+            )
             return [(local_terminal, local_failed)]
         tp_group = get_tp_group()
         gathered: list[tuple[set[str], set[str]] | None] = [None] * tp_group.world_size

@@ -120,6 +120,52 @@ def allocate_kv_offload_topk_profile_buffers(
 
 _CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
+_SHARED_POOL_PATH = "/dev/shm/glm_sparse_kv_pool"
+# Ordered list of (path, fd, mmap, base, total); one entry per
+# empty_aligned_int8_cpu_tensors call (the allocator is called once per KV
+# tensor group, so every call needs its own backing file). Keeps mappings
+# alive and is walked at registration time.
+_SHARED_POOL: list = []
+_SHARED_POOL_OFF: list = []
+
+
+def _register_kv_pool_for_mte(lo: int, hi: int, device_index: int) -> int:
+    """Map the CPU KV pool range into the device address space for MTE access.
+
+    Workaround for driver hdk26 (26.0.rc1): hybm's GVA identity mapping
+    (HYBM_FLAG_DRAM_MAP_HOST_VA) does not take effect for MTE/AIV kernels, so
+    sparse_copy on raw pool host VAs dies with 'DDR address out of range'
+    (surfaced as ACL 507057). Register the range via the driver HAL and return
+    the (device VA - host VA) delta to add to kernel-visible pool addresses.
+    CPU-side accesses keep using the untranslated host VAs.
+    """
+    import ctypes
+
+    lo &= ~4095
+    hi = (hi + 4095) & ~4095
+    hal = ctypes.CDLL("libascend_hal.so")
+    hal.halHostRegister.restype = ctypes.c_int
+    hal.halHostRegister.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    dva = ctypes.c_void_p()
+    rc = hal.halHostRegister(
+        ctypes.c_void_p(lo),
+        ctypes.c_uint64(hi - lo),
+        3,  # HOST_MEM_MAP_DEV
+        device_index,
+        ctypes.byref(dva),
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"halHostRegister(kv pool) failed rc={rc} lo={lo:#x} size={hi - lo:#x}"
+        )
+    return (dva.value or 0) - lo
+
 
 def empty_aligned_int8_cpu_tensors(
     sizes: list[int],
@@ -138,7 +184,43 @@ def empty_aligned_int8_cpu_tensors(
     """
     chunk_nums = [cdiv(size, alignment) for size in sizes]
     total_chunk_num = 1 + sum(chunk_nums)
-    raw_tensor = offload.empty([total_chunk_num * alignment], dtype=torch.int8, pin_memory=True)
+    # Allocate as a shared file mapping instead of offload.empty: every TP
+    # worker process must be able to map the same physical pool and register
+    # it with its own device for MTE access (halHostRegister maps a range to
+    # exactly one device, and only pages mapped in the calling process can be
+    # registered). See _register_kv_pool_for_mte.
+    import glob as _glob
+    import mmap as _mmap
+    import ctypes as _ctypes
+    total = total_chunk_num * alignment
+    if not _SHARED_POOL:
+        # One arena file for ALL allocator calls (one per layer): a single
+        # registration per device instead of n_layers of them keeps driver
+        # HDC/SMMU resource usage at the level of the original single-pool
+        # offload.empty design. tmpfs blocks are allocated lazily, so the
+        # oversized ftruncate costs nothing until pages are pinned.
+        for _stale in _glob.glob(_SHARED_POOL_PATH + "*"):
+            try:
+                os.unlink(_stale)
+            except OSError:
+                pass
+        _arena_bytes = int(os.environ.get("GLM_SPARSE_POOL_ARENA_GB", "120")) << 30
+        path = _SHARED_POOL_PATH + "_arena"
+        _fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.ftruncate(_fd, _arena_bytes)
+        _buf = _mmap.mmap(_fd, _arena_bytes)
+        _base = _ctypes.addressof(_ctypes.c_char.from_buffer(_buf))
+        _SHARED_POOL.append((path, _fd, _buf, _base, _arena_bytes))
+        _SHARED_POOL_OFF.append(0)
+    _apath, _afd, _abuf, _abase, _asize = _SHARED_POOL[0]
+    _off = (_SHARED_POOL_OFF[0] + alignment - 1) // alignment * alignment
+    if _off + total > _asize:
+        raise RuntimeError(
+            f"sparse KV pool arena exhausted: need {_off + total} > {_asize}; "
+            "raise GLM_SPARSE_POOL_ARENA_GB"
+        )
+    _SHARED_POOL_OFF[0] = _off + total
+    raw_tensor = torch.frombuffer(_abuf, dtype=torch.int8, count=total, offset=_off)
     base_addr = raw_tensor.data_ptr()
     if base_addr % alignment:
         base_addr = (base_addr // alignment + 1) * alignment
@@ -368,7 +450,42 @@ class SparseKVOffloadManager:
         config.rank_id = self.tp_rank
         config.scene = offload.Scene.SHARED
         assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
+        _mf_lib_dir = os.environ.get(
+            "MEMFABRIC_HYBRID_EXTEND_LIB_PATH",
+            "/usr/local/memfabric_hybrid/1.2.0/aarch64-linux/lib64",
+        )
+        import ctypes as _ctypes
+        self._accoffload_kernel = _ctypes.CDLL(
+            os.path.join(_mf_lib_dir, "libmf_hybm_accoffload_kernel.so"))
         self.tp_group.barrier()
+
+    def _mte_delta_for(self, addr: int) -> int:
+        """Translate a tp0 pool host VA to this rank's kernel-visible delta."""
+        for lo, hi, delta in self._mte_ranges:
+            if lo <= addr < hi:
+                return delta
+        raise RuntimeError(f"pool address {addr:#x} not inside any registered file range")
+
+    def _sparse_copy_direct(self, src_ptrs, dst_ptrs, lengths, sizes, device=None):
+        """Launch the accoffload sparse_copy AscendC kernel directly.
+
+        The memfabric python wrapper validates descriptor addresses against the
+        hybm GVA window and silently drops entries outside it -- which is where
+        the MTE-registered device VAs (gva + mte_gva_delta) live on driver
+        hdk26. Launching the kernel .so directly performs the copy
+        unconditionally; correctness of both directions was verified against
+        halHostRegister-mapped memory (sc_unit4).
+        """
+        import ctypes
+        stream = torch_npu.npu.current_stream().npu_stream
+        self._accoffload_kernel.OffloadOpsSparseCopy(
+            ctypes.c_void_p(src_ptrs.data_ptr()),
+            ctypes.c_void_p(dst_ptrs.data_ptr()),
+            ctypes.c_void_p(lengths.data_ptr()),
+            ctypes.c_void_p(sizes.data_ptr()),
+            ctypes.c_void_p(stream),
+        )
+        return 0
 
     def _build_cpp(self):
         os.environ["TORCH_EXTENSIONS_ALWAYS_BUILD"] = "1"
@@ -393,7 +510,10 @@ class SparseKVOffloadManager:
                 "-O3",
                 "-std=c++20",
                 "-fopenmp",
-                "-march=armv8.2-a+sve+fp16+bf16",
+                # No +sve: the A2 host CPU (Kunpeng 920) has no SVE, and -O3
+                # auto-vectorisation of the LRU helpers emits SVE
+                # instructions that trap as SIGILL on the first onload.
+                "-march=armv8.2-a+fp16+bf16",
                 "-fPIC",
                 f"-I{npu_include_path}",
                 f"-I{torch_npu_include}",
@@ -564,6 +684,77 @@ class SparseKVOffloadManager:
                     cpu_block_lens_tensor[layer_id, 1].item(),
                 )
             )
+
+        # ---- MTE pool mapping workaround (driver hdk26 / 26.0.rc1) ----
+        num_blocks = self.kv_cache_config.num_blocks
+        pool_lo = None
+        pool_hi = None
+        for layer_id in range(self.num_layers):
+            for base, per_block in (
+                (self.gvas_k_bases[layer_id], self.cpu_block_lens[layer_id][0]),
+                (self.gvas_v_bases[layer_id], self.cpu_block_lens[layer_id][1]),
+            ):
+                end = base + per_block * num_blocks
+                pool_lo = base if pool_lo is None else min(pool_lo, base)
+                pool_hi = end if pool_hi is None else max(pool_hi, end)
+        # Every rank maps the shared pool file into its own process and
+        # registers it with its own device (halHostRegister maps a range to
+        # exactly one device; a range can be registered only once per process
+        # mapping, so per-rank mappings of the same file are required).
+        # Kernel-visible address = tp0 gva + (my dva base - tp0 va base).
+        # halHostRegister must run in EACH worker process: the device mapping
+        # it creates is scoped to the registering process (SMMU/PASID), so a
+        # dva produced by a helper process makes the AIV kernel fault with
+        # "DDR address of the MTE instruction is out of range" even on the
+        # right device. Ranks other than tp0 have no pages for the pool, so
+        # each one maps the shared arena file first: same physical tmpfs pages,
+        # own virtual address, own in-process registration.
+        _dev_idx = torch_npu.npu.current_device()
+        _meta = torch.zeros(2, dtype=torch.int64, device="npu")
+        if self.tp_rank == 0:
+            assert len(_SHARED_POOL) == 1, f"expected one arena, got {len(_SHARED_POOL)}"
+            _meta[0] = _SHARED_POOL[0][3]
+            _meta[1] = _SHARED_POOL[0][4]
+        self.tp_group.broadcast(_meta, src=0)
+        _tp0_base = int(_meta[0].item())
+        _arena_size = int(_meta[1].item())
+        if self.tp_rank == 0:
+            _my_base = _tp0_base
+        else:
+            import mmap as _mmap
+            import ctypes as _ctypes
+
+            _afd = os.open(_SHARED_POOL_PATH + "_arena", os.O_RDWR)
+            _abuf = _mmap.mmap(_afd, _arena_size)
+            _my_base = _ctypes.addressof(_ctypes.c_char.from_buffer(_abuf))
+            _SHARED_POOL.append(("rank_attach", _afd, _abuf, _my_base, _arena_size))
+        _reg_delta = _register_kv_pool_for_mte(_my_base, _my_base + _arena_size, _dev_idx)
+        # Kernel-visible device VA for a tp0 pool address (in-process registration).
+        self._mte_ranges = [
+            (_tp0_base, _tp0_base + _arena_size, (_my_base + _reg_delta) - _tp0_base)
+        ]
+        # Host VA of the same byte in this process, for the RDMA read path.
+        self._pool_host_delta = _my_base - _tp0_base
+        self._pool_host_range = (_tp0_base, _tp0_base + _arena_size)
+        logger.info(
+            "Sparse KV offload arena registered in-process: rank %d device %d "
+            "arena=[%#x,%#x) device delta %#x, host delta %#x.",
+            self.tp_rank,
+            _dev_idx,
+            _tp0_base,
+            _tp0_base + _arena_size,
+            self._mte_ranges[0][2] & ((1 << 64) - 1),
+            self._pool_host_delta & ((1 << 64) - 1),
+        )
+        assert pool_lo is not None and any(lo <= pool_lo < hi for lo, hi, _ in self._mte_ranges), (
+            f"pool_lo {pool_lo:#x} not covered by any registered file range"
+        )
+        # NOTE: gvas_k/v_bases stay RAW host VAs -- the transport layer
+        # (sfa_pd_rd2h worker/read_thread) dereferences them on the CPU when
+        # bouncing pulled KV into the pool; a baked-in device delta makes the
+        # CPU fault on a device VA (devmm svm_vm_fault_host). The delta is
+        # applied late, only where addresses are handed to the sparse_copy
+        # kernel (delta applied late).
 
         gvas_buffer_offset = 0
         gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8  # 2: k+v, 8: int64
@@ -833,8 +1024,8 @@ class SparseKVOffloadManager:
             src_k = int(k_rows.data_ptr()) + token_indices * self.token_size_bytes_k
             src_v = int(v_rows.data_ptr()) + token_indices * self.token_size_bytes_v
 
-        dst_k = int(k_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_k
-        dst_v = int(v_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_v
+        dst_k = int(k_cache_cpu.data_ptr()) + self._mte_delta_for(int(k_cache_cpu.data_ptr())) + safe_slots * self.token_size_bytes_k
+        dst_v = int(v_cache_cpu.data_ptr()) + self._mte_delta_for(int(v_cache_cpu.data_ptr())) + safe_slots * self.token_size_bytes_v
         self.d2h_src_ptrs_npu[:token_count].copy_(src_k)
         self.d2h_src_ptrs_npu[token_count : 2 * token_count].copy_(src_v)
         self.d2h_dst_ptrs_npu[:token_count].copy_(dst_k)
@@ -845,7 +1036,7 @@ class SparseKVOffloadManager:
         self.d2h_lengths_npu[token_count : 2 * token_count].masked_fill_(~valid, 0)
         self.d2h_size_npu.fill_(2 * token_count)
 
-        result = offload.sparse_copy(
+        result = self._sparse_copy_direct(
             self.d2h_src_ptrs_npu,
             self.d2h_dst_ptrs_npu,
             self.d2h_lengths_npu,
@@ -931,8 +1122,8 @@ class SparseKVOffloadManager:
                 self.block_size,
                 self.token_size_bytes_k,
                 self.token_size_bytes_v,
-                self.gvas_k_bases[layer_id],
-                self.gvas_v_bases[layer_id],
+                self.gvas_k_bases[layer_id] + self._mte_delta_for(self.gvas_k_bases[layer_id]),
+                self.gvas_v_bases[layer_id] + self._mte_delta_for(self.gvas_v_bases[layer_id]),
                 self.addr_k_bases[layer_id],
                 self.addr_v_bases[layer_id],
                 self.lru_token_mark_workspace_ptr,
@@ -967,7 +1158,7 @@ class SparseKVOffloadManager:
             # Make sure that tp0 d2h is finished before other tp's h2d.
             # NOTE we can't use barrier since it can't be captured in graph.
             self.tp_group.broadcast(torch.empty([], dtype=torch.int8, device="npu"), src=0)
-        offload.sparse_copy(
+        self._sparse_copy_direct(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
             self.size_buffer_npu,

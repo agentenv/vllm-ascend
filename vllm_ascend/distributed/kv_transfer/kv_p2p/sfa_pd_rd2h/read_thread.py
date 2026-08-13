@@ -767,37 +767,36 @@ class MembPullReadThread(threading.Thread):
                 len(all_local_ptrs),
                 atomic_total,
             )
-        # CPU-pool destinations are GVAs owned by the sparse-offload hybm
-        # entity; inside the TransferEngine entity they resolve to rank 0 and
-        # BatchCopyG2G rejects them ("invalid param"). Read those into a plain
-        # host bounce buffer (classified as local host memory), then memmove
-        # into the pool. Device (indexer) targets go through untouched.
-        # Enabled via SFAPD_BOUNCE_READ=1 (env centralization pending).
-        import os as _os
-        if _os.getenv("SFAPD_BOUNCE_READ", "0") == "1" and any(all_kinds):
-            import ctypes as _ct
-            import torch as _torch
-            _cpu_total = sum(L for L, k in zip(all_lengths, all_kinds) if k == 1)
-            buf = getattr(self, "_bounce_buf", None)
-            if buf is None or buf.numel() < _cpu_total:
-                buf = _torch.empty(max(_cpu_total, 1 << 26), dtype=_torch.uint8)
-                self._bounce_buf = buf
-            _base = buf.data_ptr()
-            _send_ptrs = []
-            _fixups = []  # (orig_ptr, bounce_ptr, length)
-            _off = 0
-            for _p, _L, _k in zip(all_local_ptrs, all_lengths, all_kinds):
-                if _k == 1:
-                    _bp = _base + _off
-                    _off += _L
-                    _send_ptrs.append(_bp)
-                    _fixups.append((_p, _bp, _L))
-                else:
-                    _send_ptrs.append(_p)
+        # CPU-pool destinations (kind 1) are host VAs of the sparse-offload
+        # arena as tp0 sees it. Every rank maps the same arena file, so shift
+        # them into this process's own mapping and let the transfer write the
+        # pulled KV straight into the pool. The two obvious alternatives both
+        # crash the worker: the tp0 VA is unmapped in every other rank, and the
+        # kernel-visible device VA (arena + halHostRegister delta) is not
+        # resolvable by memfabric.
+        _host_delta = 0
+        _host_range = None
+        try:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (
+                sparse_kv_offload_manager as _skom,
+            )
+
+            _mgr = _skom._SPARSE_KV_OFFLOAD_MANAGER
+            _host_delta = getattr(_mgr, "_pool_host_delta", 0)
+            _host_range = getattr(_mgr, "_pool_host_range", None)
+        except Exception:
+            _host_range = None
+
+        if _host_range and any(all_kinds):
+            _lo, _hi = _host_range
+
+            def _to_host(addr: int) -> int:
+                if not (_lo <= addr < _hi):
+                    raise RuntimeError(f"pool destination {addr:#x} outside arena")
+                return addr + _host_delta
+
+            _send_ptrs = [_to_host(_p) if _k == 1 else _p for _p, _k in zip(all_local_ptrs, all_kinds)]
             ret = self.engine.batch_transfer_sync_read(p_session, _send_ptrs, all_peer_ptrs, all_lengths)
-            if ret == 0:
-                for _p, _bp, _L in _fixups:
-                    _ct.memmove(_p, _bp, _L)
         else:
             ret = self.engine.batch_transfer_sync_read(p_session, all_local_ptrs, all_peer_ptrs, all_lengths)
         if ret != 0:
