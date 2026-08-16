@@ -164,11 +164,8 @@ class MembPullSendingThread(threading.Thread):
     def record_p_save_event(self, layer_idx: int) -> Any:
         """Record KV-scatter completion for one layer of one step.
 
-        Returned so the caller can hand it to the matching ``SendTask``. It is
-        also kept in ``_p_save_events`` only as a fallback for callers that do
-        not thread it through; that map is keyed by layer alone, so with
-        several steps in flight one step's task can consume another step's
-        event, which is why the task-carried one takes precedence.
+        Returned so the caller can attach it to the matching ``SendTask``; the
+        layer-keyed map is kept only as a fallback for callers that do not.
         """
         evt = torch.npu.Event()
         evt.record()
@@ -183,22 +180,15 @@ class MembPullSendingThread(threading.Thread):
 
     def _process_send_task(self, send_task: SendTask, encoder: msgspec.msgpack.Encoder) -> None:
         layer_idx = send_task.layer_idx
-        # Telling D to pull before this layer's KV scatter has landed hands it
-        # whatever the block held before -- for a reused block, the previous
-        # request's KV, read as if it were this one's. Prefer the event carried
-        # by the task: it belongs to this exact (step, layer). The layer-keyed
-        # map is only a fallback, and with two steps in flight it can already
-        # have been drained by the other step's task, so never treat "no event"
-        # as "nothing to wait for" -- fall back to a full device sync instead.
-        #
-        # Wait via this thread's stream rather than Event.synchronize(): the
-        # event is recorded by the model-forward thread, and calling
-        # synchronize() on it from here returns immediately without waiting, so
-        # the notification raced ahead of the scatter. Making our own stream
-        # wait on the event and then draining that stream does block, and keeps
-        # the wait off the forward thread and off the other streams.
+        # Notifying D before this layer's KV scatter lands makes it pull the
+        # block's previous contents -- the last request's KV, since blocks are
+        # reused. Prefer the task's own event; the layer-keyed map cannot tell
+        # two in-flight steps apart, and a missing event must never be read as
+        # "nothing to wait for".
         wait_event = send_task.wait_event or self._p_save_events.pop(layer_idx, None)
         if wait_event is not None:
+            # Event.synchronize() does not wait on an event recorded by the
+            # model-forward thread; waiting through this thread's stream does.
             stream = torch.npu.current_stream()
             stream.wait_event(wait_event)
             stream.synchronize()

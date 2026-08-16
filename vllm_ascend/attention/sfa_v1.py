@@ -1944,11 +1944,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             notify_kv_cache_written(self.layer_name or "")
 
         if kv_cache is not None and self.is_kv_producer:
-            # Record once every KV scatter for this layer is on the stream --
-            # main above, indexer just now. The event was only ever constructed,
-            # so a PD connector waiting on it to know the cache is written was
-            # waiting on a never-recorded event, which completes immediately and
-            # lets the consumer read the block before it has been filled.
+            # Record once this layer's scatters are on the stream. The event was
+            # only ever constructed, so a PD connector waiting on it to learn the
+            # cache is written waited on a never-recorded event.
             attn_metadata.reshape_cache_event.record()
 
         if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:
