@@ -496,6 +496,8 @@ class AscendSFADCPMetadataBuilder(
     DCPMetadataBuilderMixin,
     AscendSFAMetadataBuilder,
 ):
+    _in_replicated_view = False
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -687,6 +689,21 @@ class AscendSFADCPMetadataBuilder(
         return valid_block_ids, remapped_block_table.to(torch.int32)
 
     def _build_with_metadata_view(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        build_metadata: Callable[[], AscendSFAMetadata],
+    ) -> AscendSFAMetadata:
+        # build()/build_for_drafting() already route through this hook, so a
+        # nested call must not expand the replicated view a second time.
+        if self._in_replicated_view:
+            return build_metadata()
+        self._in_replicated_view = True
+        try:
+            return self._build_with_replicated_view(common_attn_metadata, build_metadata)
+        finally:
+            self._in_replicated_view = False
+
+    def _build_with_replicated_view(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         build_metadata: Callable[[], AscendSFAMetadata],

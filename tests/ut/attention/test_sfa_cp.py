@@ -238,3 +238,61 @@ def test_sfa_dcp_updates_dsa_cp_local_slot_mapping_with_padding() -> None:
         dsa_cp_context.slot_mapping_cp,
         torch.tensor([12, 13, -1], dtype=torch.int32),
     )
+
+
+def test_sfa_dcp_metadata_view_expands_replicated_block_table_once() -> None:
+    # A builder that wraps build() re-enters the hook the base build() already
+    # calls. Buffers are wide enough for a second expansion to succeed, so only
+    # the block ids reveal it: BT*cp+r is correct, BT*cp^2+cp*r+r' is not.
+    builder = _make_builder()
+    builder.decode_threshold = 1
+    builder.dcp_local_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
+    builder.block_table_replicated_view_buf = torch.empty((4, 16), dtype=torch.int32)
+    builder.arange_buffer = torch.arange(16, dtype=torch.int32)
+
+    expansions = []
+    expand = builder._build_block_table_replicated_view
+
+    def counting_expand(block_table, *args, **kwargs):
+        expansions.append(block_table.clone())
+        return expand(block_table, *args, **kwargs)
+
+    builder._build_block_table_replicated_view = counting_expand
+
+    common = SimpleNamespace(
+        slot_mapping=torch.arange(4, dtype=torch.int32),
+        block_table_tensor=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+        num_reqs=1,
+        num_input_tokens=4,
+        num_actual_tokens=4,
+        seq_lens=torch.tensor([16], dtype=torch.int32),
+        dcp_local_seq_lens=torch.tensor([8], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        positions=torch.arange(4, dtype=torch.int32),
+    )
+
+    seen = []
+
+    def build_metadata():
+        seen.append(common.block_table_tensor.clone())
+        metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
+        metadata.seq_lens = common.seq_lens
+        return metadata
+
+    with patch(
+        "vllm_ascend.attention.context_parallel.sfa_cp.split_decodes_and_prefills",
+        return_value=(1, 0, 4, 0),
+    ):
+        # Outer wrapper, then the base builder's own call to the same hook.
+        builder._build_with_metadata_view(
+            common,
+            lambda: builder._build_with_metadata_view(common, build_metadata),
+        )
+
+    assert len(seen) == 1
+    torch.testing.assert_close(
+        seen[0],
+        torch.tensor([[20, 21, 22, 23, 24, 25, 26, 27]], dtype=torch.int32),
+    )
+    assert len(expansions) == 1
+    assert common.block_table_tensor.shape == (1, 4)
